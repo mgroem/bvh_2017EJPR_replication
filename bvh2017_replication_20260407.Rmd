@@ -1,0 +1,1731 @@
+---
+title: "Annotated replication script: Birch & Van Ham (2017)"
+author: "Max Groemping"
+date: "2026-04-07"
+output:
+  html_document:
+    toc: true
+    toc_depth: 4
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+    df_print: paged
+editor_options:
+  chunk_output_type: console
+---
+
+```{r include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE,
+  error = FALSE
+)
+
+options(
+  width = 120,
+  dplyr.summarise.inform = TRUE
+)
+```
+
+# Note
+Conducted with assistance from ChatGPT 5.4.
+
+# Overview
+
+This notebook documents a replication workflow. The target is **Birch and Van Ham (2017)**, “Getting away with foul play? The importance of formal and informal oversight institutions for electoral integrity,” *European Journal of Political Research* 56(3): 487–511. <a href="https://doi.org/10.1111/1475-6765.12189" target="_blank">https://doi.org/10.1111/1475-6765.12189</a>
+
+The script attempts to reconstruct the sample used for Table 1, Model 2, and Table 2, Models 1–3. The workflow proceeds in five steps:
+
+1. load and harmonise the source datasets;
+2. construct a common country-election-year analysis file;
+3. diagnose sample composition and compare it to the published sample;
+4. estimate the fixed-effects specifications; and
+5. compare the resulting estimates to the published coefficients.
+
+# Important note on the replication outcome
+
+This replication attempt ultimately has to be treated as **unsuccessful**. Even after substantial harmonisation work, the reconstructed sample does not cleanly match the published sample, and the substantive model results do not replicate closely. The most plausible reason is not a coding error alone, but the absence of sufficiently detailed documentation and replication data for the original article. That leaves key choices about sample construction, coding decisions, and data vintages underdetermined.
+
+The notebook therefore documents a **transparent failed replication attempt** rather than a successful reproduction. 
+
+# 1. Setup and data input
+
+This section clears the workspace, loads packages, and imports the underlying data sources used in the reconstruction. The script combines V-Dem, QoG, WDI, NELDA, IDEA, and a local DEMI file. It also standardises country identifiers and checks basic coverage.
+
+```{r setup-and-input}
+# !diagnostics off
+
+rm(list=ls())
+options(scipen=999)
+
+# override table so that it always uses "NA"
+table <- function(..., useNA = "always") {
+  base::table(..., useNA = useNA)
+}
+
+
+options(scipen=999)
+options(java.parameters = "-Xmx4g")
+
+library(vdemdata)
+library(rqog)
+library(WDI)
+library(tidyverse)
+library(janitor)
+library(countrycode)
+library(plm)
+library(sandwich)
+library(lmtest)
+library(modelsummary)
+library(readr)
+library(readxl)
+library(curl)
+library(sandwich)
+library(plm)
+library(officer)
+library(flextable)
+library(gt)
+
+
+
+
+
+# READ DATA ---------------------------------------------------------------
+
+# DEM
+dem <- read.csv("data/demi_long_v1.csv")
+
+## V-Dem
+vdem <- vdem
+vdem$ISO <- vdem$country_text_id
+vdem$country_text_id <- NULL
+vdem <- vdem 
+
+## QoG 
+# `rqog::read_qog()` can fail during knitting because it relies on an internal
+# downloader that is sometimes interrupted on large files. To make the notebook
+# more robust, download the QoG standard time-series CSV directly, cache it
+# locally, and then read it from disk.
+qog_url_candidates <- c(
+  "https://www.qogdata.pol.gu.se/data/qog_std_ts_jan23.csv",
+  "http://www.qogdata.pol.gu.se/data/qog_std_ts_jan23.csv"
+)
+qog_cache_dir  <- file.path("data", "cache")
+dir.create(qog_cache_dir, recursive = TRUE, showWarnings = FALSE)
+qog_cache_file <- file.path(qog_cache_dir, "qog_std_ts_jan23.csv")
+
+if (!file.exists(qog_cache_file)) {
+  download_ok <- FALSE
+  for (u in qog_url_candidates) {
+    try({
+      utils::download.file(u, destfile = qog_cache_file, mode = "wb", quiet = FALSE)
+      download_ok <- file.exists(qog_cache_file) && file.info(qog_cache_file)$size > 1000000
+    }, silent = TRUE)
+    if (download_ok) break
+  }
+  if (!download_ok) {
+    stop(
+      paste0(
+        "Unable to download the QoG standard time-series dataset automatically. ",
+        "Please download qog_std_ts_jan23.csv manually from the QoG data archive ",
+        "and save it to: ", qog_cache_file
+      )
+    )
+  }
+}
+
+qog <- readr::read_csv(qog_cache_file, show_col_types = FALSE)
+qog$ISO <- qog$ccodealp
+
+## NELDA 
+nelda_url  <- "https://www.dropbox.com/scl/fi/f9tqjn2d46ehekrphjvq8/NELDA.xls?rlkey=ceu5l116m0c3fed63pgl3600i&dl=1"
+nelda_path <- file.path(tempdir(), "NELDA.xls")
+curl::curl_download(url = nelda_url, destfile = nelda_path, quiet = FALSE)
+nelda <- readxl::read_xls(nelda_path)
+
+## WDI
+wdi_indicators <- c(
+  gdp_pc     = "NY.GDP.PCAP.CD",     # GDP per capita (current US$)
+  gdp_growth = "NY.GDP.PCAP.KD.ZG"   # GDP per capita growth (%)
+)
+wdi <- WDI(
+  country   = "all",
+  indicator = wdi_indicators,
+  start     = 1990,
+  end       = 2012,
+  extra     = FALSE
+)
+
+
+## IDEA 2006 electoral management model (governmental/mixed/independent)
+idea <- readxl::read_xlsx(
+  "data/idea_export_electoral_management_design_database_region.xlsx"
+)
+
+
+## CLEAN AND HARMONISE -----------------------------------------------------
+
+# vdem
+vdem <- vdem %>%
+  mutate(
+    ISO  = as.character(ISO),
+    year = as.integer(year)
+  )
+
+# qog
+qog <- qog %>%
+  mutate(
+    ISO  = as.character(ISO),
+    year = as.integer(year)
+  )
+
+# nelda
+nelda <- nelda %>%
+  mutate(
+    ISO = countrycode(
+      sourcevar = ccode,
+      origin    = "cown",
+      destination = "iso3c"
+    ),
+    year = as.integer(year)
+  )
+
+nelda <- nelda %>%
+  mutate(
+    ISO = case_when(
+      # Germany: drop pre-unification composite
+      ccode == 260 ~ "DEU",
+      
+      # GDR: drop
+      ccode == 265 ~ NA_character_,
+      
+      # Czechoslovakia: drop (pre-1993 only)
+      ccode == 315 ~ NA_character_,
+      
+      # China (PRC)
+      ccode %in% c(340, 345) ~ "CHN",
+      
+      # Taiwan (BVH exclude)
+      ccode == 347 ~ NA_character_,
+      
+      # Zanzibar (exclude)
+      ccode == 396 ~ NA_character_,
+      
+      # Tanzania (use ISO)
+      ccode == 397 ~ "TZA",
+      
+      # Yemen (post-1990 unified)
+      ccode %in% c(678, 680) ~ "YEM",
+      
+      # Soviet Union (exclude)
+      ccode == 817 ~ NA_character_,
+      
+      # Serbia & Montenegro → Serbia
+      ccode %in% c(971, 972) ~ "SRB",
+      
+      # Montenegro (post-2006 only, BVH exclude)
+      ccode == 973 ~ NA_character_,
+      
+      # Everything else: use countrycode result
+      TRUE ~ ISO
+    )
+  )
+
+nelda <- nelda %>%
+  filter(!is.na(ISO))
+
+
+
+
+
+
+# wdi
+wdi <- wdi %>%
+  mutate(
+    ISO  = as.character(iso3c),
+    year = as.integer(year)
+  ) %>%
+  select(ISO, year, gdp_pc, gdp_growth)
+
+# idea
+idea <- idea %>%
+  mutate(
+    ISO = as.character(ISO3)
+  ) %>%
+  select(
+    ISO,
+    `Electoral Management Design Database - Model of electoral management`
+  )
+
+# Check ISO format
+lapply(list(vdem, qog, nelda, wdi, idea), function(x) table(nchar(x$ISO)))
+
+# Check year ranges
+```
+
+# 2. Variable construction and harmonisation
+
+The next step subsets the relevant years, creates the election-level and year-level variables needed for the analysis, and harmonises coding across the source datasets.
+
+A few choices are especially important here:
+
+- NELDA is used to identify election events and international observers.
+- V-Dem supplies the election integrity outcome and de facto EMB autonomy/capacity measures.
+- QoG contributes institutional and regional controls.
+- IDEA provides the de jure EMB independence measure.
+- The script codes election type as **Legislative**, **Executive**, or **Concurrent**, with legislative elections as the reference category.
+
+```{r harmonise-variables}
+# SUBSET AND CREATE VARIABLES --------------------------------------------------------
+
+# nelda    (keep elections as unit, following B & vH)
+nelda_elec <- nelda %>%
+  
+  # Restrict to analysis period
+  filter(year >= 1990, year <= 2012) %>%
+  
+  # Keep only needed variables
+  select(
+    ISO,
+    year,
+    electionid,
+    types,
+    nelda45
+  ) %>%
+  
+  # Drop Constituent Assembly elections (BVH scope)
+  filter(types != "Constituent Assembly") %>%
+  
+  # Election-level recodes
+  mutate(
+    # International observers (election-level)
+    intobs = case_when(
+      nelda45 == "yes" ~ 1,
+      nelda45 == "no"  ~ 0,
+      TRUE             ~ NA_real_
+    ),
+    
+    # Election type flags (election-level)
+    leg  = ifelse(types == "Legislative/Parliamentary", 1, 0),
+    exec = ifelse(types == "Executive", 1, 0)
+  )
+
+nelda_year_flags <- nelda_elec %>%    # identify concurrent elections
+  group_by(ISO, year) %>%
+  summarise(
+    has_leg  = max(leg,  na.rm = TRUE),
+    has_exec = max(exec, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+nelda_elec <- nelda_elec %>%     # merge back and retain election-year as unit of analysis
+  left_join(
+    nelda_year_flags,
+    by = c("ISO", "year")
+  ) %>%
+  
+  # Construct BVH election-type coding
+  mutate(
+    election_type = case_when(
+      has_leg == 1 & has_exec == 1 ~ "Concurrent",
+      exec == 1 & has_leg == 0     ~ "Executive",
+      leg  == 1 & has_exec == 0    ~ "Legislative",
+      TRUE                         ~ NA_character_
+    ),
+    election_type = factor(
+      election_type,
+      levels = c("Legislative", "Executive", "Concurrent")
+    ),
+    
+    # BVH dummies (Legislative is baseline)
+    type_exec = ifelse(election_type == "Executive", 1, 0),
+    type_conc = ifelse(election_type == "Concurrent", 1, 0)
+  )
+
+# Election-type distribution
+table(nelda_elec$election_type, useNA = "always")
+
+
+
+
+# vdem    (keep election-years  [but unit is country-year combination, not el;ection event])
+
+# ------------------------------------------------------------
+# V-Dem: minimal preprocessing for merger with NELDA elections
+# ------------------------------------------------------------
+
+vdem <- vdem %>%
+  
+  # Restrict to analysis period
+  filter(year >= 1990, year <= 2012) %>%
+  
+  # Keep only required variables
+  select(
+    ISO,
+    year,
+    v2x_regime,
+    
+    # Election integrity components (ordinal)
+    v2elvotbuy_ord,
+    v2elintim_ord,
+    v2elpeace_ord,
+    v2elfrfair_ord,
+    
+    # EMB characteristics (ordinal)
+    v2elembaut_ord,
+    v2elembcap_ord,
+    
+    # Domestic observers
+    v2eldommon
+  ) %>%
+  
+  # Construct election integrity DV
+  # (will be NA outside election years automatically)
+  mutate(
+    electionintegrity = rowMeans(
+      cbind(
+        v2elvotbuy_ord,
+        v2elintim_ord,
+        v2elpeace_ord,
+        v2elfrfair_ord
+      ),
+      na.rm = FALSE
+    )
+  )
+
+
+
+
+
+
+# wdi
+wdi <- wdi %>%
+  filter(year >= 1990, year <= 2012) %>%
+  mutate(
+    gdp_pc_log = log(gdp_pc)
+  ) %>%
+  select(
+    ISO,
+    year,
+    gdp_pc_log,
+    gdp_growth
+  )
+
+wdi <- wdi %>%   # Drop rows with missing or empty ISO codes:
+  filter(!is.na(ISO), ISO != "")
+
+
+# idea
+years <- 1990:2012
+idea <- idea %>%    # expand to country–year format
+  tidyr::expand_grid(year = years)
+
+idea <- idea %>%
+  mutate(
+    emb_ind_idea = case_when(
+      `Electoral Management Design Database - Model of electoral management` == "Independent" ~ 1,
+      `Electoral Management Design Database - Model of electoral management` %in% c("Governmental", "Mixed") ~ 0,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  select(
+    ISO,
+    year,
+    emb_ind_idea
+  )
+
+idea <- idea %>%
+  group_by(ISO) %>%
+  mutate(
+    emb_ind_idea = ifelse(
+      all(is.na(emb_ind_idea)),
+      NA_real_,
+      as.numeric(names(sort(table(emb_ind_idea), decreasing = TRUE)[1]))
+    )
+  ) %>%
+  ungroup()
+
+idea <- idea %>%   # drop missing ISOs
+  filter(!is.na(ISO))
+
+
+
+# qog
+qog <- qog %>%      # region variable is now ten regions, was 7 regions at time of Birch & van Ham paper
+  mutate(
+    ht_region7 = case_when(
+      ht_region == 1 ~ 1,  # Western Europe & North America
+      ht_region == 2 ~ 2,  # Eastern Europe & Central Asia
+      ht_region == 3 ~ 3,  # Latin America
+      ht_region == 4 ~ 4,  # Sub-Saharan Africa
+      ht_region == 5 ~ 5,  # Middle East & North Africa
+      ht_region == 6 ~ 6,  # South Asia
+      ht_region %in% c(7, 8, 9, 10) ~ 7,  # East & Southeast Asia + Pacific
+      TRUE ~ NA_real_
+    )
+  )
+
+qog <- qog %>%      # recode majoritarian electoral system (yes/no)
+  mutate(
+    majoritarian = case_when(
+      iaep_es %in% c(1, 2) ~ 1,
+      iaep_es %in% c(3, 4) ~ 0,
+      TRUE ~ NA_real_
+    )
+  )
+
+qog <- qog %>%
+  mutate(
+    ciri_assn = ifelse(ciri_assn %in% c(0, 1, 2), ciri_assn, NA_real_),
+    ciri_injud = ifelse(ciri_injud %in% c(0, 1, 2), ciri_injud, NA_real_),
+    ciri_speech = ifelse(ciri_speech %in% c(0, 1, 2), ciri_speech, NA_real_)   # bich & van ham call this ' independence of media'
+  )
+
+qog <- qog %>%
+  filter(year >= 1990, year <= 2012)
+
+
+```
+
+# 3. Merge the datasets
+
+The merged dataset starts from NELDA election events and then adds the country-year attributes from the other sources. The script then restricts the sample to multiparty regimes, in line with the reconstruction of Birch and Van Ham’s design.
+
+```{r merge-data}
+# MERGE -------------------------------------------------------------------
+
+############################################################
+## MERGE DATASETS: START FROM NELDA ELECTION EVENTS
+############################################################
+
+df <- nelda_elec %>%
+  
+  ##########################################################
+## 1. Merge V-Dem (election-year attributes)
+##########################################################
+left_join(
+  vdem %>%
+    select(
+      ISO,
+      year,
+      v2x_regime,
+      electionintegrity,
+      v2elembaut_ord,
+      v2elembcap_ord,
+      v2eldommon
+    ),
+  by = c("ISO", "year")
+) %>%
+  
+  ##########################################################
+## 3. Restrict to multiparty regimes (BVH sample)
+##########################################################
+filter(v2x_regime > 0) %>%
+  
+  ##########################################################
+## 4. Merge WDI (economic controls)
+##########################################################
+left_join(
+  wdi,
+  by = c("ISO", "year")
+) %>%
+  
+  ##########################################################
+## 5. Merge IDEA (de jure EMB independence)
+##########################################################
+left_join(
+  idea,
+  by = c("ISO", "year")
+) %>%
+  
+  ##########################################################
+## 6. Merge QoG (institutions, regions, electoral system)
+##########################################################
+left_join(
+  qog %>%
+    select(
+      ISO = ccodealp,
+      year,
+      ht_region7,
+      majoritarian,
+      ciri_injud,
+      ciri_assn,
+      ciri_speech
+    ),
+  by = c("ISO", "year")
+)
+
+##########################################################
+## 7. Merge DEMI (democracy / observer indicators)
+##########################################################
+df <- df %>%
+  left_join(
+    dem %>%
+      mutate(
+        ISO  = as.character(ISO),
+        year = as.integer(year)
+      ),
+    by = c("ISO", "year")
+  )
+
+
+
+# Final structure check
+nrow(df)
+length(unique(df$ISO))
+table(df$election_type)
+
+# Key BVH comparison numbers
+summary(df$electionintegrity)
+summary(df$v2elembaut_ord)
+summary(df$emb_ind_idea)
+
+# Panel structure
+```
+
+# 4. Build the analysis unit and estimation sample
+
+A central challenge in this replication is that the source data naturally mix **election events** and **country-years**. The script therefore collapses the merged event-level data to one observation per country-year, while preserving information on whether the election year involved legislative, executive, or concurrent contests.
+
+This section also applies the listwise deletion rule used for the fixed-effects specifications and checks the resulting sample against the published target of **847 elections in 146 countries**.
+
+```{r construct-analysis-unit}
+############################################################
+## ANALYSIS UNIT + MODEL-SPECIFIC SAMPLE
+## Birch & Van Ham (2017): one country-election-year observation
+## used consistently for all FE models (Table 1 model 2; Table 2 models 1–3)
+############################################################
+
+library(dplyr)
+library(forcats)
+
+# Helper: first non-missing value within a country-year
+first_nonmissing <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(NA)
+  x[1]
+}
+
+# ------------------------------------------------------------------
+# 1) CONSTRUCT THE ANALYSIS UNIT EXACTLY ONCE
+# ------------------------------------------------------------------
+# Start from the merged election-event data `df`.
+# Collapse to one observation per ISO-year without using an ad hoc priority rule.
+# Election type is defined from the set of election events observed that year:
+#   - Concurrent: both legislative and executive elections in the same year
+#   - Executive: executive only
+#   - Legislative: legislative only
+#
+# All substantive covariates used in the article are year-level, so for duplicated
+# rows within ISO-year they should be identical after the merges; we keep the first
+# non-missing value and check consistency below.
+
+analysis_df <- df %>%
+  mutate(
+    exec_event = ifelse(types == "Executive", 1L, 0L),
+    leg_event  = ifelse(types == "Legislative/Parliamentary", 1L, 0L)
+  ) %>%
+  group_by(ISO, year) %>%
+  summarise(
+    # diagnostics on the raw event structure
+    n_event_rows = n(),
+    any_exec = max(exec_event, na.rm = TRUE),
+    any_leg  = max(leg_event,  na.rm = TRUE),
+    
+    # election-type coding used in the paper (Legislative reference)
+    election_type = case_when(
+      any_exec == 1L & any_leg == 1L ~ "Concurrent",
+      any_exec == 1L & any_leg == 0L ~ "Executive",
+      any_exec == 0L & any_leg == 1L ~ "Legislative",
+      TRUE                           ~ NA_character_
+    ),
+    
+    type_exec = ifelse(election_type == "Executive", 1, 0),
+    type_conc = ifelse(election_type == "Concurrent", 1, 0),
+    
+    # dependent variable and regressors: keep one country-year value
+    electionintegrity = first_nonmissing(electionintegrity),
+    v2elembaut_ord    = first_nonmissing(v2elembaut_ord),
+    v2elembcap_ord    = first_nonmissing(v2elembcap_ord),
+    v2eldommon        = first_nonmissing(v2eldommon),
+    intobs            = first_nonmissing(intobs),
+    gdp_growth        = first_nonmissing(gdp_growth),
+    gdp_pc_log        = first_nonmissing(gdp_pc_log),
+    ciri_injud        = first_nonmissing(ciri_injud),
+    ciri_speech       = first_nonmissing(ciri_speech),
+    ciri_assn         = first_nonmissing(ciri_assn),
+    v2x_regime        = first_nonmissing(v2x_regime),
+    
+    # optional fields retained for diagnostics / later models
+    emb_ind_idea      = first_nonmissing(emb_ind_idea),
+    majoritarian      = first_nonmissing(majoritarian),
+    ht_region7        = first_nonmissing(ht_region7),
+    
+    .groups = "drop"
+  ) %>%
+  mutate(
+    election_type = factor(
+      election_type,
+      levels = c("Legislative", "Executive", "Concurrent")
+    )
+  )
+
+# Basic construction diagnostics
+cat("\n====================\nANALYSIS UNIT DIAGNOSTICS\n====================\n")
+cat("Rows in raw merged election-event data: ", nrow(df), "\n", sep = "")
+cat("Rows in analysis_df (ISO-year):         ", nrow(analysis_df), "\n", sep = "")
+cat("Countries in analysis_df:               ", dplyr::n_distinct(analysis_df$ISO), "\n", sep = "")
+cat("\nElection type distribution:\n")
+print(table(analysis_df$election_type, useNA = "always"))
+
+cat("\nCountry-years with multiple election-event rows before collapse:\n")
+print(sum(analysis_df$n_event_rows > 1, na.rm = TRUE))
+
+# ------------------------------------------------------------------
+# Optional but useful: consistency checks
+# ------------------------------------------------------------------
+# These variables should ordinarily be constant within ISO-year after merges.
+# If they are not, flag it before estimating anything.
+
+consistency_check <- df %>%
+  group_by(ISO, year) %>%
+  summarise(
+    n_electionintegrity = n_distinct(electionintegrity, na.rm = TRUE),
+    n_v2elembaut_ord    = n_distinct(v2elembaut_ord,    na.rm = TRUE),
+    n_v2elembcap_ord    = n_distinct(v2elembcap_ord,    na.rm = TRUE),
+    n_v2eldommon        = n_distinct(v2eldommon,        na.rm = TRUE),
+    n_intobs            = n_distinct(intobs,            na.rm = TRUE),
+    n_gdp_growth        = n_distinct(gdp_growth,        na.rm = TRUE),
+    n_gdp_pc_log        = n_distinct(gdp_pc_log,        na.rm = TRUE),
+    n_ciri_injud        = n_distinct(ciri_injud,        na.rm = TRUE),
+    n_ciri_speech       = n_distinct(ciri_speech,       na.rm = TRUE),
+    n_ciri_assn         = n_distinct(ciri_assn,         na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(
+    n_electionintegrity > 1 | n_v2elembaut_ord > 1 | n_v2elembcap_ord > 1 |
+      n_v2eldommon > 1 | n_intobs > 1 | n_gdp_growth > 1 | n_gdp_pc_log > 1 |
+      n_ciri_injud > 1 | n_ciri_speech > 1 | n_ciri_assn > 1
+  )
+
+if (nrow(consistency_check) > 0) {
+  cat("\nWARNING: Some ISO-years have inconsistent values across duplicated event rows.\n")
+  print(head(consistency_check, 20))
+} else {
+  cat("\nNo within-ISO-year inconsistencies detected in model variables.\n")
+}
+
+# ------------------------------------------------------------------
+# 2) APPLY MODEL-SPECIFIC LISTWISE DELETION TO THAT SAME DATASET
+# ------------------------------------------------------------------
+# Published Table 1 model 2 and Table 2 use FE, so de jure EMB independence is excluded.
+# The displayed FE model includes:
+#   de facto EMB independence
+#   judiciary independence
+#   media independence
+#   civil society freedom
+#   EMB capacity
+#   international observers
+#   domestic observers
+#   GDP per capita growth
+#   log GDP per capita
+#   election type
+#
+# Region is only noted for model 1, and de jure EMB independence is dropped in FE.
+# Majoritarian is not shown in Table 1 model 2 or Table 2, so it is not used here.
+
+fe_vars <- c(
+  "electionintegrity",
+  "v2elembaut_ord",
+  "ciri_injud",
+  "ciri_speech",
+  "ciri_assn",
+  "v2elembcap_ord",
+  "intobs",
+  "v2eldommon",
+  "gdp_growth",
+  "gdp_pc_log",
+  "election_type"
+)
+
+analysis_fe <- analysis_df %>%
+  filter(
+    year >= 1990, year <= 2012,
+    v2x_regime > 0
+  ) %>%
+  filter(if_all(all_of(fe_vars), ~ !is.na(.))) %>%
+  droplevels()
+
+cat("\n====================\nFE ESTIMATION SAMPLE\n====================\n")
+cat("N (elections / ISO-years): ", nrow(analysis_fe), "\n", sep = "")
+cat("N (countries):             ", dplyr::n_distinct(analysis_fe$ISO), "\n", sep = "")
+cat("\nElection type distribution in FE sample:\n")
+print(table(analysis_fe$election_type, useNA = "always"))
+
+# ------------------------------------------------------------------
+# 3) VERIFY AGAINST THE PUBLISHED TARGET
+# ------------------------------------------------------------------
+target_n_elections <- 847L
+target_n_countries <- 146L
+
+actual_n_elections <- nrow(analysis_fe)
+actual_n_countries <- dplyr::n_distinct(analysis_fe$ISO)
+
+cat("\n====================\nTARGET CHECK\n====================\n")
+cat("Published target: 847 elections, 146 countries\n")
+cat("Your sample:      ", actual_n_elections, " elections, ", actual_n_countries, " countries\n", sep = "")
+
+if (actual_n_elections == target_n_elections && actual_n_countries == target_n_countries) {
+  cat("MATCH: sample size matches Birch & Van Ham (2017).\n")
+} else {
+  cat("NO MATCH: sample size does not match Birch & Van Ham (2017).\n")
+  cat("Difference: ",
+      actual_n_elections - target_n_elections, " elections; ",
+      actual_n_countries - target_n_countries, " countries\n", sep = "")
+}
+
+# This is the only dataset you should pass to pdata.frame / plm for Table 1 model 2 and Table 2.
+```
+
+# 5. Sample forensics
+
+Because the reconstructed fixed-effects sample does not initially line up with the published one, the script includes a substantial amount of forensic work. This is one of the most valuable parts of the notebook: it makes the unresolved sample problem visible instead of hiding it.
+
+The code below inspects:
+
+- the number of elections per country in the fixed-effects sample;
+- missingness across model variables;
+- how observations are dropped step by step;
+- alternative coding rules for observer variables; and
+- a final decision to exclude three suspicious country cases (`BTN`, `TLS`, and `MNE`).
+
+These diagnostics are precisely the kind of material that helps readers assess whether the replication problem is due to coding, data availability, or missing information from the original study.
+
+```{r sample-forensics}
+# SOME MORE SAMPLE FORENSICS ----------------------------------------------
+
+# Countries and # of elections per country in the FE sample
+analysis_fe %>%
+  count(ISO, sort = TRUE) %>%
+  arrange(ISO) %>%
+  print(n = Inf)
+
+
+country_counts <- analysis_fe %>%
+  count(ISO, name = "n_elections")
+
+table(country_counts$n_elections)
+
+country_counts %>%
+  filter(n_elections == 1) %>%
+  arrange(ISO)
+
+fe_keys <- analysis_fe %>%
+  distinct(ISO, year) %>%
+  arrange(ISO, year)
+
+print(fe_keys, n = Inf)
+
+
+vars_to_check <- c(
+  "electionintegrity",
+  "v2elembaut_ord",
+  "ciri_injud",
+  "ciri_speech",
+  "ciri_assn",
+  "v2elembcap_ord",
+  "intobs",
+  "v2eldommon",
+  "gdp_growth",
+  "gdp_pc_log",
+  "election_type"
+)
+
+loss_table <- lapply(vars_to_check, function(v) {
+  data.frame(
+    variable = v,
+    n_missing = sum(is.na(analysis_df[[v]])),
+    n_nonmissing = sum(!is.na(analysis_df[[v]]))
+  )
+}) %>%
+  bind_rows()
+
+loss_table
+
+
+tmp <- analysis_df %>%
+  filter(year >= 1990, year <= 2012, v2x_regime > 0)
+
+track <- data.frame(
+  step = "start: regime-filtered",
+  n_elections = nrow(tmp),
+  n_countries = n_distinct(tmp$ISO)
+)
+
+for (v in fe_vars) {
+  tmp <- tmp %>% filter(!is.na(.data[[v]]))
+  track <- bind_rows(track, data.frame(
+    step = paste("drop missing", v),
+    n_elections = nrow(tmp),
+    n_countries = n_distinct(tmp$ISO)
+  ))
+}
+
+track
+
+
+nelda %>%
+  count(nelda45, sort = TRUE)
+
+
+analysis_df_alt <- df %>%
+  mutate(
+    exec_event = ifelse(types == "Executive", 1L, 0L),
+    leg_event  = ifelse(types == "Legislative/Parliamentary", 1L, 0L)
+  ) %>%
+  group_by(ISO, year) %>%
+  summarise(
+    n_event_rows = n(),
+    any_exec = max(exec_event, na.rm = TRUE),
+    any_leg  = max(leg_event,  na.rm = TRUE),
+    election_type = case_when(
+      any_exec == 1L & any_leg == 1L ~ "Concurrent",
+      any_exec == 1L & any_leg == 0L ~ "Executive",
+      any_exec == 0L & any_leg == 1L ~ "Legislative",
+      TRUE                           ~ NA_character_
+    ),
+    electionintegrity = first_nonmissing(electionintegrity),
+    v2elembaut_ord    = first_nonmissing(v2elembaut_ord),
+    v2elembcap_ord    = first_nonmissing(v2elembcap_ord),
+    
+    # changed rule here
+    intobs     = ifelse(all(is.na(intobs)), NA, max(intobs, na.rm = TRUE)),
+    v2eldommon = ifelse(all(is.na(v2eldommon)), NA, max(v2eldommon, na.rm = TRUE)),
+    
+    gdp_growth  = first_nonmissing(gdp_growth),
+    gdp_pc_log  = first_nonmissing(gdp_pc_log),
+    ciri_injud  = first_nonmissing(ciri_injud),
+    ciri_speech = first_nonmissing(ciri_speech),
+    ciri_assn   = first_nonmissing(ciri_assn),
+    v2x_regime  = first_nonmissing(v2x_regime),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    election_type = factor(election_type, levels = c("Legislative", "Executive", "Concurrent"))
+  )
+
+analysis_fe_alt <- analysis_df_alt %>%
+  filter(year >= 1990, year <= 2012, v2x_regime > 0) %>%
+  filter(if_all(all_of(fe_vars), ~ !is.na(.)))
+
+c(
+  n_elections = nrow(analysis_fe_alt),
+  n_countries = n_distinct(analysis_fe_alt$ISO)
+)
+
+
+
+audit_df <- analysis_df %>%
+  mutate(
+    keep_regime = v2x_regime > 0,
+    miss_electionintegrity = is.na(electionintegrity),
+    miss_v2elembaut_ord    = is.na(v2elembaut_ord),
+    miss_ciri_injud        = is.na(ciri_injud),
+    miss_ciri_speech       = is.na(ciri_speech),
+    miss_ciri_assn         = is.na(ciri_assn),
+    miss_v2elembcap_ord    = is.na(v2elembcap_ord),
+    miss_intobs            = is.na(intobs),
+    miss_v2eldommon        = is.na(v2eldommon),
+    miss_gdp_growth        = is.na(gdp_growth),
+    miss_gdp_pc_log        = is.na(gdp_pc_log),
+    miss_election_type     = is.na(election_type)
+  ) %>%
+  mutate(
+    dropped_fe = !(
+      keep_regime &
+        !miss_electionintegrity &
+        !miss_v2elembaut_ord &
+        !miss_ciri_injud &
+        !miss_ciri_speech &
+        !miss_ciri_assn &
+        !miss_v2elembcap_ord &
+        !miss_intobs &
+        !miss_v2eldommon &
+        !miss_gdp_growth &
+        !miss_gdp_pc_log &
+        !miss_election_type
+    )
+  )
+
+audit_df %>%
+  filter(dropped_fe) %>%
+  arrange(ISO, year) %>%
+  print(n = Inf)
+
+
+analysis_fe_nomne <- analysis_fe %>%
+  filter(!ISO %in% c("BTN", "TLS", "MNE"))
+
+c(
+  n_elections = nrow(analysis_fe_nomne),
+  n_countries = dplyr::n_distinct(analysis_fe_nomne$ISO)
+)
+
+
+analysis_fe %>%
+  filter(ISO %in% c("BTN", "TLS", "MNE")) %>%
+  arrange(ISO, year)
+
+analysis_fe %>%
+  count(ISO, sort = TRUE) %>%
+  filter(n >= 9) %>%
+  arrange(desc(n), ISO) %>%
+  print(n = Inf)
+
+dup_obs <- df %>%
+  group_by(ISO, year) %>%
+  summarise(
+    n_rows = n(),
+    n_intobs = dplyr::n_distinct(intobs, na.rm = TRUE),
+    n_domobs = dplyr::n_distinct(v2eldommon, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(n_rows > 1 & (n_intobs > 1 | n_domobs > 1))
+
+dup_obs %>% arrange(ISO, year)
+
+# -> Decision to exlcude three suspicious countries BTN, TLS, and MNE
+analysis_fe_final <- analysis_fe %>%
+  filter(!ISO %in% c("BTN", "TLS", "MNE"))
+
+cat("Final FE sample after exclusions:", nrow(analysis_fe_final), "elections in", dplyr::n_distinct(analysis_fe_final$ISO), "countries\n")
+```
+
+# 6. Descriptive comparison with the article appendix
+
+Before moving to the regression models, the script compares the reconstructed descriptive statistics to Appendix Table 1.1 in Birch and Van Ham (2017). This is a useful intermediate validity check.
+
+The comparison suggests that some variables track the published descriptives reasonably closely, but others do not. In the original script, the main discrepancies are concentrated in election integrity, EMB capacity, international observers, and the majoritarian electoral-system measure. Those discrepancies already suggest that the reconstructed sample is not fully aligned with the one used in the article.
+
+```{r descriptives-comparison}
+# COMPARE DESCRIPTIVES TO BIRCH & VAN HAM APPENDIX TABLE 1.1 -------------
+# Recommended comparison sample: analysis_df (collapsed country-year sample)
+# Not analysis_fe_final, because Appendix Table 1.1 is for the broader descriptive sample.
+
+library(dplyr)
+library(tibble)
+library(flextable)
+library(officer)
+
+# Choose comparison dataset:
+#   analysis_df       = best match to Appendix Table 1.1
+#   analysis_fe_final = FE estimation sample after exclusions
+desc_data <- analysis_df
+
+# Helper
+desc_stats <- function(x) {
+  x_nonmiss <- x[!is.na(x)]
+  c(
+    N    = length(x_nonmiss),
+    Mean = if (length(x_nonmiss) == 0) NA_real_ else mean(x_nonmiss),
+    Min  = if (length(x_nonmiss) == 0) NA_real_ else min(x_nonmiss),
+    Max  = if (length(x_nonmiss) == 0) NA_real_ else max(x_nonmiss)
+  )
+}
+
+# Recode type of election to match appendix coding:
+# Legislative = 1, Executive = 2, Concurrent = 3
+type_num <- dplyr::case_when(
+  desc_data$election_type == "Legislative" ~ 1,
+  desc_data$election_type == "Executive"   ~ 2,
+  desc_data$election_type == "Concurrent"  ~ 3,
+  TRUE ~ NA_real_
+)
+
+# Your descriptives
+my_descriptives <- rbind(
+  "Election integrity"                        = desc_stats(desc_data$electionintegrity),
+  "De jure EMB independence"                  = desc_stats(desc_data$emb_ind_idea),
+  "De facto EMB independence"                 = desc_stats(desc_data$v2elembaut_ord),
+  "Independence of judiciary"                 = desc_stats(desc_data$ciri_injud),
+  "Independence of media"                     = desc_stats(desc_data$ciri_speech),
+  "Civil society freedom"                     = desc_stats(desc_data$ciri_assn),
+  "EMB capacity"                              = desc_stats(desc_data$v2elembcap_ord),
+  "International observers present?"          = desc_stats(desc_data$intobs),
+  "Domestic observers present?"               = desc_stats(desc_data$v2eldommon),
+  "GDP per capita annual growth %"            = desc_stats(desc_data$gdp_growth),
+  "Real GDP per capita log (current USD)"     = desc_stats(desc_data$gdp_pc_log),
+  "Legislative electoral system majoritarian" = desc_stats(desc_data$majoritarian),
+  "Type of election"                          = desc_stats(type_num),
+  "Region"                                    = desc_stats(desc_data$ht_region7)
+) %>%
+  as.data.frame() %>%
+  rownames_to_column("Variable")
+
+# Birch & Van Ham Appendix Table 1.1
+bvh_descriptives <- tibble(
+  Variable = c(
+    "Election integrity",
+    "De jure EMB independence",
+    "De facto EMB independence",
+    "Independence of judiciary",
+    "Independence of media",
+    "Civil society freedom",
+    "EMB capacity",
+    "International observers present?",
+    "Domestic observers present?",
+    "GDP per capita annual growth %",
+    "Real GDP per capita log (current USD)",
+    "Legislative electoral system majoritarian",
+    "Type of election",
+    "Region"
+  ),
+  BVH_N    = c(1045, 1033, 1045, 949, 913, 912, 1045, 1045, 1007, 994, 1012, 1045, 1045, 1045),
+  BVH_Mean = c(2.61, 0.66, 2.46, 1.13, 1.11, 1.33, 2.77, 0.52, 0.91, 2.02, 7.88, 0.43, 1.68, 3.42),
+  BVH_Min  = c(0.39, 0, 0.07, 0, 0, 0, 0.24, 0, 0, -45.33, 4.80, 0, 1, 1),
+  BVH_Max  = c(3.97, 1, 3.97, 2, 2, 2, 4.00, 1, 1, 104.66, 11.39, 1, 3, 7)
+)
+
+# Merge and compute differences
+comparison_df <- bvh_descriptives %>%
+  left_join(my_descriptives, by = "Variable") %>%
+  rename(
+    Your_N    = N,
+    Your_Mean = Mean,
+    Your_Min  = Min,
+    Your_Max  = Max
+  ) %>%
+  mutate(
+    Diff_N    = Your_N    - BVH_N,
+    Diff_Mean = Your_Mean - BVH_Mean,
+    Diff_Min  = Your_Min  - BVH_Min,
+    Diff_Max  = Your_Max  - BVH_Max
+  )
+
+# Print rounded comparison to console
+comparison_print <- comparison_df %>%
+  mutate(across(-Variable, ~ round(., 2)))
+
+print(comparison_print, n = Inf)
+
+# Export to Word
+ft <- flextable(comparison_print) |>
+  autofit()
+
+save_as_docx(
+  "Descriptives vs Birch & Van Ham Appendix Table 1.1" = ft,
+  path = "results/descriptives_bvh_appendix_table1_1.docx"
+)
+
+# My descriptives track Birch and Van Ham’s Appendix Table 1.1 closely for the main institutional covariates and election type, 
+# but differ more noticeably for election integrity, EMB capacity, international observers, and majoritarian electoral system, 
+# likely reflecting differences in data vintage and some remaining harmonisation differences in observer and electoral-system coding.
+```
+
+# 7. Replication of Table 1, Model 2
+
+This section estimates the fixed-effects model corresponding to Table 1, Model 2, reports the conventional fixed-effects output from `summary(m2_fe)`, runs a Hausman test against random effects, and creates a side-by-side comparison table with the published coefficients.
+
+The substantive takeaway remains the same: the fixed-effects estimator is still preferred, but the model does **not** replicate closely. In particular, the coefficient for de facto EMB independence remains positive and statistically significant, yet it is markedly smaller than in the published article, while several other coefficients differ in magnitude, significance, and sometimes sign.
+
+For transparency, the notebook still computes clustered robust standard errors separately. Those do not change the point estimates, sample size, or \(R^2\), but they can change the estimated precision of the coefficients, which means that statistical significance may weaken or disappear under robust inference.
+
+```{r table1-model2}
+############################################################
+## TABLE 1, MODEL 2 — BIRCH & VAN HAM (2017)
+## Fixed effects replication with standardised coefficients
+############################################################
+
+library(plm)
+library(lmtest)
+library(sandwich)
+library(modelsummary)
+library(dplyr)
+library(tibble)
+library(flextable)
+library(officer)
+library(gt)
+
+# ----------------------------------------------------------
+# Helper: z-standardise safely
+# ----------------------------------------------------------
+z_std <- function(x) {
+  s <- stats::sd(x, na.rm = TRUE)
+  m <- mean(x, na.rm = TRUE)
+  if (is.na(s) || s == 0) return(rep(NA_real_, length(x)))
+  (x - m) / s
+}
+
+star_code <- function(p) {
+  if (is.na(p)) return("")
+  if (p < 0.001) return("***")
+  if (p < 0.01)  return("**")
+  if (p < 0.05)  return("*")
+  if (p < 0.10)  return("+")
+  return("")
+}
+
+format_summary_plm <- function(sum_obj, coef_map, model_name, rsq, n_elections, n_countries) {
+  coef_tbl <- as.data.frame(sum_obj$coefficients) %>%
+    tibble::rownames_to_column("raw_term") %>%
+    mutate(
+      term = coef_map[raw_term],
+      value = paste0(
+        sprintf("%.3f", Estimate),
+        vapply(`Pr(>|t|)`, star_code, character(1)),
+        " (",
+        sprintf("%.3f", `Std. Error`),
+        ")"
+      )
+    ) %>%
+    select(term, value)
+
+  gof_tbl <- tibble(
+    term = c("R-squared", "N (elections)", "N (countries)"),
+    value = c(
+      sprintf("%.3f", rsq),
+      as.character(n_elections),
+      as.character(n_countries)
+    )
+  )
+
+  bind_rows(coef_tbl, gof_tbl) %>%
+    rename(!!model_name := value)
+}
+
+# ----------------------------------------------------------
+# 0) Use final FE sample and standardise all model variables
+# ----------------------------------------------------------
+tab1_m2_data <- analysis_fe_final %>%
+  mutate(
+    election_type = factor(
+      election_type,
+      levels = c("Legislative", "Executive", "Concurrent")
+    ),
+    election_type_exec = ifelse(election_type == "Executive", 1, 0),
+    election_type_conc = ifelse(election_type == "Concurrent", 1, 0)
+  ) %>%
+  mutate(
+    electionintegrity_z   = z_std(electionintegrity),
+    v2elembaut_ord_z      = z_std(v2elembaut_ord),
+    ciri_injud_z          = z_std(ciri_injud),
+    ciri_speech_z         = z_std(ciri_speech),
+    ciri_assn_z           = z_std(ciri_assn),
+    v2elembcap_ord_z      = z_std(v2elembcap_ord),
+    intobs_z              = z_std(intobs),
+    v2eldommon_z          = z_std(v2eldommon),
+    gdp_growth_z          = z_std(gdp_growth),
+    gdp_pc_log_z          = z_std(gdp_pc_log),
+    election_type_exec_z  = z_std(election_type_exec),
+    election_type_conc_z  = z_std(election_type_conc)
+  )
+
+cat("Replication sample:\n")
+cat("N elections:", nrow(tab1_m2_data), "\n")
+cat("N countries:", dplyr::n_distinct(tab1_m2_data$ISO), "\n")
+
+# 1) Declare panel structure
+pdata_tab1_m2 <- pdata.frame(tab1_m2_data, index = c("ISO", "year"))
+
+# 2) Estimate Table 1, Model 2 with standardised variables
+m2_fe <- plm(
+  electionintegrity_z ~
+    v2elembaut_ord_z +
+    ciri_injud_z +
+    ciri_speech_z +
+    ciri_assn_z +
+    v2elembcap_ord_z +
+    intobs_z +
+    v2eldommon_z +
+    gdp_growth_z +
+    gdp_pc_log_z +
+    election_type_exec_z +
+    election_type_conc_z,
+  data   = pdata_tab1_m2,
+  model  = "within",
+  effect = "individual"
+)
+
+sum_m2_fe <- summary(m2_fe)
+print(sum_m2_fe)
+
+# 3) Cluster-robust inference
+vcov_m2_cluster <- vcovHC(
+  m2_fe,
+  method  = "arellano",
+  type    = "HC1",
+  cluster = "group"
+)
+
+m2_fe_cluster <- coeftest(m2_fe, vcov. = vcov_m2_cluster)
+print(m2_fe_cluster)
+
+# 4) Hausman check against RE using same standardised specification
+m2_re <- plm(
+  electionintegrity_z ~
+    v2elembaut_ord_z +
+    ciri_injud_z +
+    ciri_speech_z +
+    ciri_assn_z +
+    v2elembcap_ord_z +
+    intobs_z +
+    v2eldommon_z +
+    gdp_growth_z +
+    gdp_pc_log_z +
+    election_type_exec_z +
+    election_type_conc_z,
+  data   = pdata_tab1_m2,
+  model  = "random",
+  effect = "individual"
+)
+
+hausman_m2 <- phtest(m2_fe, m2_re)
+print(hausman_m2)
+
+# 5) Published results (still unstandardised; keep for reference only)
+bvh_tab1_m2 <- tribble(
+  ~term, ~`B&VH 2017`,
+  "De facto EMB independence",        "0.319*** (0.025)",
+  "Independence of judiciary",        "0.041* (0.020)",
+  "Independence of media",            "0.066*** (0.019)",
+  "Civil society freedom",            "0.037* (0.019)",
+  "EMB capacity",                     "0.132*** (0.035)",
+  "International election observers", "0.007 (0.023)",
+  "Domestic election observers",      "0.084+ (0.043)",
+  "GDP per capita annual growth",     "-0.006*** (0.001)",
+  "Real GDP per capita log",          "0.003 (0.019)",
+  "Executive",                        "-0.022 (0.022)",
+  "Concurrent",                       "-0.011 (0.026)",
+  "R-squared",                        "0.252",
+  "N (elections)",                    "847",
+  "N (countries)",                    "146"
+)
+
+coef_map_tab1 <- c(
+  "v2elembaut_ord_z"     = "De facto EMB independence",
+  "ciri_injud_z"         = "Independence of judiciary",
+  "ciri_speech_z"        = "Independence of media",
+  "ciri_assn_z"          = "Civil society freedom",
+  "v2elembcap_ord_z"     = "EMB capacity",
+  "intobs_z"             = "International election observers",
+  "v2eldommon_z"         = "Domestic election observers",
+  "gdp_growth_z"         = "GDP per capita annual growth",
+  "gdp_pc_log_z"         = "Real GDP per capita log",
+  "election_type_exec_z" = "Executive",
+  "election_type_conc_z" = "Concurrent"
+)
+
+rep_tab1_m2 <- format_summary_plm(
+  sum_obj      = sum_m2_fe,
+  coef_map     = coef_map_tab1,
+  model_name   = "Replication FE (standardised)",
+  rsq          = unname(sum_m2_fe$r.squared["rsq"]),
+  n_elections  = nrow(tab1_m2_data),
+  n_countries  = dplyr::n_distinct(tab1_m2_data$ISO)
+)
+
+term_order <- c(
+  "De facto EMB independence",
+  "Independence of judiciary",
+  "Independence of media",
+  "Civil society freedom",
+  "EMB capacity",
+  "International election observers",
+  "Domestic election observers",
+  "GDP per capita annual growth",
+  "Real GDP per capita log",
+  "Executive",
+  "Concurrent",
+  "R-squared",
+  "N (elections)",
+  "N (countries)"
+)
+
+table_side_by_side <- bvh_tab1_m2 %>%
+  left_join(rep_tab1_m2, by = "term") %>%
+  mutate(term = factor(term, levels = term_order)) %>%
+  arrange(term) %>%
+  mutate(term = as.character(term))
+
+print(table_side_by_side, n = Inf)
+
+gt_tab1 <- table_side_by_side %>%
+  gt() %>%
+  tab_header(
+    title = "Table 1, Model 2: Birch & Van Ham (2017) vs. Replication",
+    subtitle = "Published coefficients compared with standardised replication FE estimates"
+  ) %>%
+  cols_label(
+    term = "",
+    `B&VH 2017` = "B&VH 2017",
+    `Replication FE (standardised)` = "Replication FE (std.)"
+  ) %>%
+  tab_source_note(md(
+    "Replication column reports coefficients from a model estimated on z-standardised dependent and independent variables, including standardised election-type dummies. The published Birch & Van Ham coefficients are unstandardised and therefore are not directly comparable in magnitude."
+  ))
+
+gt_tab1
+
+gtsave(gt_tab1, "results/table1_model2_replication_standardised_gt.html")
+
+ft <- flextable(table_side_by_side) |>
+  autofit()
+
+save_as_docx(
+  "Table 1, Model 2. Birch & Van Ham (2017) vs. Replication (standardised)" = ft,
+  path = "results/table1_model2_replication_standardised.docx"
+)
+
+# The Table 1, Model 2 fixed-effects specification was implemented following Birch and Van Ham, and the Hausman test in the replication sample also favored fixed effects, but the substantive results do not replicate closely. Using the raw conventional FE output, de facto EMB independence remains positive and statistically significant but is substantially smaller than in the published article, and several other coefficients differ materially in magnitude, significance, and in some cases sign. Robust standard errors affect the precision of the estimates rather than the point estimates themselves, so they may further weaken statistical significance without resolving the underlying coefficient and sample discrepancies.
+
+
+```
+
+# 8. Replication of Table 2 interaction models
+
+The next section estimates the three fixed-effects interaction models from Table 2. Each model interacts de facto EMB independence with one oversight institution:
+
+- judiciary independence;
+- media independence; or
+- civil society freedom.
+
+The comparison tables below use the conventional fixed-effects output from `summary(m1_tab2)`, `summary(m2_tab2)`, and `summary(m3_tab2)`. Robust clustered standard errors are still computed as a diagnostic, but they are not used to populate the side-by-side comparison table.
+
+The broad result remains negative for replication purposes: while the interaction terms remain negative, the judiciary interaction is weaker than published and the media and civil society interactions no longer reach conventional significance in the reconstructed dataset. Robust standard errors would only affect the precision of those estimates, so significance could weaken further or disappear.
+
+```{r table2-models}
+
+############################################################
+## TABLE 2 — BIRCH & VAN HAM (2017)
+## Fixed effects interaction models with standardised coefficients
+############################################################
+
+library(plm)
+library(lmtest)
+library(sandwich)
+library(dplyr)
+library(tibble)
+library(flextable)
+library(officer)
+library(gt)
+
+# ----------------------------------------------------------
+# Helper: z-standardise safely
+# ----------------------------------------------------------
+if (!exists("z_std")) {
+  z_std <- function(x) {
+    s <- stats::sd(x, na.rm = TRUE)
+    m <- mean(x, na.rm = TRUE)
+    if (is.na(s) || s == 0) return(rep(NA_real_, length(x)))
+    (x - m) / s
+  }
+}
+
+# 0) Use the final FE replication sample and standardise all model variables
+
+tab2_data <- analysis_fe_final %>%
+  mutate(
+    election_type = factor(
+      election_type,
+      levels = c("Legislative", "Executive", "Concurrent")
+    ),
+    election_type_exec = ifelse(election_type == "Executive", 1, 0),
+    election_type_conc = ifelse(election_type == "Concurrent", 1, 0)
+  ) %>%
+  mutate(
+    electionintegrity_z   = z_std(electionintegrity),
+    v2elembaut_ord_z      = z_std(v2elembaut_ord),
+    ciri_injud_z          = z_std(ciri_injud),
+    ciri_speech_z         = z_std(ciri_speech),
+    ciri_assn_z           = z_std(ciri_assn),
+    v2elembcap_ord_z      = z_std(v2elembcap_ord),
+    intobs_z              = z_std(intobs),
+    v2eldommon_z          = z_std(v2eldommon),
+    gdp_growth_z          = z_std(gdp_growth),
+    gdp_pc_log_z          = z_std(gdp_pc_log),
+    election_type_exec_z  = z_std(election_type_exec),
+    election_type_conc_z  = z_std(election_type_conc)
+  )
+
+cat("Replication sample:\n")
+cat("N elections:", nrow(tab2_data), "\n")
+cat("N countries:", dplyr::n_distinct(tab2_data$ISO), "\n")
+
+# 1) Declare panel structure
+
+pdata_tab2 <- pdata.frame(tab2_data, index = c("ISO", "year"))
+
+# 2) Estimate Table 2 models on standardised variables
+
+m1_tab2 <- plm(
+  electionintegrity_z ~
+    v2elembaut_ord_z +
+    ciri_injud_z +
+    ciri_speech_z +
+    ciri_assn_z +
+    v2elembaut_ord_z:ciri_injud_z +
+    v2elembcap_ord_z +
+    intobs_z +
+    v2eldommon_z +
+    gdp_growth_z +
+    gdp_pc_log_z +
+    election_type_exec_z +
+    election_type_conc_z,
+  data   = pdata_tab2,
+  model  = "within",
+  effect = "individual"
+)
+
+m2_tab2 <- plm(
+  electionintegrity_z ~
+    v2elembaut_ord_z +
+    ciri_injud_z +
+    ciri_speech_z +
+    ciri_assn_z +
+    v2elembaut_ord_z:ciri_speech_z +
+    v2elembcap_ord_z +
+    intobs_z +
+    v2eldommon_z +
+    gdp_growth_z +
+    gdp_pc_log_z +
+    election_type_exec_z +
+    election_type_conc_z,
+  data   = pdata_tab2,
+  model  = "within",
+  effect = "individual"
+)
+
+m3_tab2 <- plm(
+  electionintegrity_z ~
+    v2elembaut_ord_z +
+    ciri_injud_z +
+    ciri_speech_z +
+    ciri_assn_z +
+    v2elembaut_ord_z:ciri_assn_z +
+    v2elembcap_ord_z +
+    intobs_z +
+    v2eldommon_z +
+    gdp_growth_z +
+    gdp_pc_log_z +
+    election_type_exec_z +
+    election_type_conc_z,
+  data   = pdata_tab2,
+  model  = "within",
+  effect = "individual"
+)
+
+sum_m1_tab2 <- summary(m1_tab2)
+sum_m2_tab2 <- summary(m2_tab2)
+sum_m3_tab2 <- summary(m3_tab2)
+
+print(sum_m1_tab2)
+print(sum_m2_tab2)
+print(sum_m3_tab2)
+
+# 3) Keep robust inference as a diagnostic, but do not use it in the comparison table
+
+vcov_m1_tab2 <- vcovHC(
+  m1_tab2,
+  method  = "arellano",
+  type    = "HC1",
+  cluster = "group"
+)
+
+vcov_m2_tab2 <- vcovHC(
+  m2_tab2,
+  method  = "arellano",
+  type    = "HC1",
+  cluster = "group"
+)
+
+vcov_m3_tab2 <- vcovHC(
+  m3_tab2,
+  method  = "arellano",
+  type    = "HC1",
+  cluster = "group"
+)
+
+ct_m1_tab2 <- coeftest(m1_tab2, vcov. = vcov_m1_tab2)
+ct_m2_tab2 <- coeftest(m2_tab2, vcov. = vcov_m2_tab2)
+ct_m3_tab2 <- coeftest(m3_tab2, vcov. = vcov_m3_tab2)
+
+print(ct_m1_tab2)
+print(ct_m2_tab2)
+print(ct_m3_tab2)
+
+# 4) Helper functions
+
+star_code <- function(p) {
+  if (is.na(p)) return("")
+  if (p < 0.001) return("***")
+  if (p < 0.01)  return("**")
+  if (p < 0.05)  return("*")
+  if (p < 0.10)  return("+")
+  return("")
+}
+
+format_summary_plm <- function(sum_obj, coef_map, model_name, rsq, n_elections, n_countries) {
+  coef_tbl <- as.data.frame(sum_obj$coefficients) %>%
+    tibble::rownames_to_column("raw_term") %>%
+    mutate(
+      term = coef_map[raw_term],
+      value = paste0(
+        sprintf("%.3f", Estimate),
+        vapply(`Pr(>|t|)`, star_code, character(1)),
+        " (",
+        sprintf("%.3f", `Std. Error`),
+        ")"
+      )
+    ) %>%
+    select(term, value)
+
+  gof_tbl <- tibble(
+    term = c("R-squared", "N (elections)", "N (countries)"),
+    value = c(
+      sprintf("%.3f", rsq),
+      as.character(n_elections),
+      as.character(n_countries)
+    )
+  )
+
+  bind_rows(coef_tbl, gof_tbl) %>%
+    rename(!!model_name := value)
+}
+
+coef_map_tab2 <- c(
+  "v2elembaut_ord_z" = "De facto EMB independence (0–4)",
+  "ciri_injud_z" = "Independence of judiciary (0–2)",
+  "ciri_speech_z" = "Independence of media (0–2)",
+  "ciri_assn_z" = "Civil society freedom (0–2)",
+  "v2elembaut_ord_z:ciri_injud_z" = "EMB independence * judiciary",
+  "v2elembaut_ord_z:ciri_speech_z" = "EMB independence * media",
+  "v2elembaut_ord_z:ciri_assn_z" = "EMB independence * civil society",
+  "v2elembcap_ord_z" = "EMB capacity (0–4)",
+  "intobs_z" = "International observers present? (0–1)",
+  "v2eldommon_z" = "Domestic observers present? (0–1)",
+  "gdp_growth_z" = "GDP per capita annual growth %",
+  "gdp_pc_log_z" = "Real GDP per capita log (current US$)",
+  "election_type_exec_z" = "Executive",
+  "election_type_conc_z" = "Concurrent"
+)
+
+# 5) Published results
+
+bvh_tab2 <- tribble(
+  ~term, ~`Model 1: B&VH 2017`, ~`Model 2: B&VH 2017`, ~`Model 3: B&VH 2017`,
+  "De facto EMB independence (0–4)",      "0.370*** (0.028)", "0.362*** (0.028)", "0.387*** (0.031)",
+  "Independence of judiciary (0–2)",      "0.183*** (0.043)", "0.034+ (0.020)",   "0.042* (0.020)",
+  "Independence of media (0–2)",          "0.060** (0.019)",  "0.193*** (0.042)", "0.065*** (0.019)",
+  "Civil society freedom (0–2)",          "0.037* (0.018)",   "0.037* (0.018)",   "0.159*** (0.038)",
+  "EMB independence * judiciary",         "-0.064*** (0.017)", NA,                  NA,
+  "EMB independence * media",             NA,                  "-0.053*** (0.016)", NA,
+  "EMB independence * civil society",     NA,                  NA,                  "-0.058*** (0.016)",
+  "EMB capacity (0–4)",                   "0.130*** (0.034)", "0.134*** (0.034)", "0.123*** (0.035)",
+  "International observers present? (0–1)", "0.007 (0.023)",  "0.003 (0.023)",     "0.006 (0.023)",
+  "Domestic observers present? (0–1)",    "0.076+ (0.043)",   "0.093* (0.043)",    "0.077+ (0.043)",
+  "GDP per capita annual growth %",       "-0.005*** (0.001)","-0.006*** (0.001)","-0.006*** (0.001)",
+  "Real GDP per capita log (current US$)", "0.003 (0.019)",   "0.002 (0.019)",     "0.002 (0.019)",
+  "Executive",                            "-0.023 (0.022)",   "-0.021 (0.022)",    "-0.019 (0.022)",
+  "Concurrent",                           "-0.013 (0.027)",   "-0.008 (0.027)",    "-0.007 (0.027)",
+  "R-squared",                            "0.367",            "0.364",             "0.366",
+  "N (elections)",                        "847",              "847",               "847",
+  "N (countries)",                        "146",              "146",               "146"
+)
+
+rep_m1_tab2 <- format_summary_plm(
+  sum_obj      = sum_m1_tab2,
+  coef_map     = coef_map_tab2,
+  model_name   = "Model 1: Replication FE (standardised)",
+  rsq          = unname(sum_m1_tab2$r.squared["rsq"]),
+  n_elections  = nrow(tab2_data),
+  n_countries  = dplyr::n_distinct(tab2_data$ISO)
+)
+
+rep_m2_tab2 <- format_summary_plm(
+  sum_obj      = sum_m2_tab2,
+  coef_map     = coef_map_tab2,
+  model_name   = "Model 2: Replication FE (standardised)",
+  rsq          = unname(sum_m2_tab2$r.squared["rsq"]),
+  n_elections  = nrow(tab2_data),
+  n_countries  = dplyr::n_distinct(tab2_data$ISO)
+)
+
+rep_m3_tab2 <- format_summary_plm(
+  sum_obj      = sum_m3_tab2,
+  coef_map     = coef_map_tab2,
+  model_name   = "Model 3: Replication FE (standardised)",
+  rsq          = unname(sum_m3_tab2$r.squared["rsq"]),
+  n_elections  = nrow(tab2_data),
+  n_countries  = dplyr::n_distinct(tab2_data$ISO)
+)
+
+# 6) Merge and order
+
+term_order_tab2 <- c(
+  "De facto EMB independence (0–4)",
+  "Independence of judiciary (0–2)",
+  "Independence of media (0–2)",
+  "Civil society freedom (0–2)",
+  "EMB independence * judiciary",
+  "EMB independence * media",
+  "EMB independence * civil society",
+  "EMB capacity (0–4)",
+  "International observers present? (0–1)",
+  "Domestic observers present? (0–1)",
+  "GDP per capita annual growth %",
+  "Real GDP per capita log (current US$)",
+  "Executive",
+  "Concurrent",
+  "R-squared",
+  "N (elections)",
+  "N (countries)"
+)
+
+table2_side_by_side <- bvh_tab2 %>%
+  left_join(rep_m1_tab2, by = "term") %>%
+  left_join(rep_m2_tab2, by = "term") %>%
+  left_join(rep_m3_tab2, by = "term") %>%
+  mutate(term = factor(term, levels = term_order_tab2)) %>%
+  arrange(term) %>%
+  mutate(term = as.character(term))
+
+print(table2_side_by_side, n = Inf)
+
+# 7) Export tables
+
+gt_tab2 <- table2_side_by_side %>%
+  gt() %>%
+  tab_header(
+    title = "Table 2: Birch & Van Ham (2017) vs. Replication",
+    subtitle = "Published interaction models compared with standardised replication FE estimates"
+  ) %>%
+  cols_label(term = "") %>%
+  tab_source_note(md(
+    "Replication columns report coefficients from fixed-effects models estimated on z-standardised dependent and independent variables, including standardised election-type dummies. Interaction terms are formed from the standardised constituent variables. The published Birch and Van Ham coefficients are unstandardised and therefore are not directly comparable in magnitude. Robust standard errors are reported separately as a diagnostic and do not change point estimates, N, or R-squared."
+  ))
+
+gt_tab2
+
+gtsave(gt_tab2, "results/table2_replication_standardised_gt.html")
+
+ft2 <- flextable(table2_side_by_side) |>
+  autofit()
+
+save_as_docx(
+  "Table 2. Birch & Van Ham (2017) vs. Replication (standardised)" = ft2,
+  path = "results/table2_replication_standardised.docx"
+)
+
+
+# The interaction models do not replicate closely. Using the conventional FE output, the judiciary interaction remains negative and statistically significant but is weaker than reported in the article, while the media and civil society interaction terms remain negative but are no longer statistically significant. The substantive mismatch is therefore present even before switching to robust inference; robust standard errors would only affect the precision of the estimates and could further weaken significance.
+
+
+```
+
+# 9. Conclusion
+
+The published materials are insufficient for full computational reproducibility. Without the original replication files or fuller documentation of sample construction and coding choices, it is not possible to determine with confidence whether the remaining discrepancies stem from data vintages, undocumented harmonisation decisions, omitted exclusions, or some other hidden step.
+
+For that reason, the replication has to be **abandoned at the stage of model comparison**. 
+
